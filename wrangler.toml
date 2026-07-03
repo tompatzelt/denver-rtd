@@ -1,0 +1,11 @@
+name = "denver-transit-api"
+main = "src/index.js"
+compatibility_date = "2024-09-23"
+
+# Create this namespace with: npx wrangler kv namespace create GTFS_STATIC
+# then paste the id it prints below (and add a preview_id for local `wrangler dev`,
+# created with: npx wrangler kv namespace create GTFS_STATIC --preview)
+[[kv_namespaces]]
+binding = "GTFS_STATIC"
+id = "ab6882159e7a442599ba996efc79c404"
+preview_id = "ab6882159e7a442599ba996efc79c404"
