@@ -1,4 +1,4 @@
-name = "denver-transit-api"
+name = "denver-rtd"
 main = "src/index.js"
 compatibility_date = "2024-09-23"
 
