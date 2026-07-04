@@ -23,6 +23,7 @@ let stopsCache = null;
 let tripsCache = null;
 let routesCache = null;
 let stopRoutesCache = null;
+let routeStopsCache = null;
 
 async function loadStops(env) {
   if (stopsCache) return stopsCache;
@@ -54,6 +55,14 @@ async function loadStopRoutes(env) {
   if (!raw) throw new Error("stop_routes.json missing from KV");
   stopRoutesCache = JSON.parse(raw);
   return stopRoutesCache;
+}
+
+async function loadRouteStops(env) {
+  if (routeStopsCache) return routeStopsCache;
+  const raw = await env.GTFS_STATIC.get("route_stops.json");
+  if (!raw) throw new Error("route_stops.json missing from KV");
+  routeStopsCache = JSON.parse(raw);
+  return routeStopsCache;
 }
 
 function haversineKm(lat1, lon1, lat2, lon2) {
@@ -92,25 +101,41 @@ async function handleNearby(url, env) {
 
   const [stops, stopRoutes] = await Promise.all([loadStops(env), loadStopRoutes(env)]);
 
-  const results = [];
+  const candidates = [];
   for (const s of stops) {
     const d = haversineKm(lat, lon, s.lat, s.lon);
     if (d <= radiusKm) {
-      results.push({
+      candidates.push({
         ...s,
         distance_m: Math.round(d * 1000),
         routes: stopRoutes[s.stop_id] || [],
       });
     }
   }
-  results.sort((a, b) => a.distance_m - b.distance_m);
-  const nearest = results.slice(0, limit);
+  candidates.sort((a, b) => a.distance_m - b.distance_m);
 
-  const nearestBusStop = results.find((s) => s.routes.some((r) => r.mode === "bus")) || null;
-  const nearestRailStop = results.find((s) => s.routes.some((r) => r.mode === "rail")) || null;
+  // Nearest-of-each-mode is computed against the full candidate list, before
+  // dedup, so it always reflects the truly closest stop.
+  const nearestBusStop = candidates.find((s) => s.routes.some((r) => r.mode === "bus")) || null;
+  const nearestRailStop = candidates.find((s) => s.routes.some((r) => r.mode === "rail")) || null;
+
+  // Collapse stops that only offer route+direction combos already covered
+  // by a closer stop — e.g. redundant stop poles a block apart serving the
+  // same line toward the same place. A stop offering the *opposite*
+  // direction of the same route (or a route not seen yet) still counts as
+  // new information and stays in the list.
+  const seenCombos = new Set();
+  const deduped = [];
+  for (const stop of candidates) {
+    const newRoutes = stop.routes.filter((r) => !seenCombos.has(`${r.short_name}|${r.headsign}`));
+    if (stop.routes.length > 0 && newRoutes.length === 0) continue; // fully redundant
+    for (const r of stop.routes) seenCombos.add(`${r.short_name}|${r.headsign}`);
+    deduped.push(stop);
+    if (deduped.length >= limit) break;
+  }
 
   return json({
-    stops: nearest,
+    stops: deduped,
     nearest_bus: nearestBusStop
       ? { stop_id: nearestBusStop.stop_id, stop_name: nearestBusStop.stop_name, distance_m: nearestBusStop.distance_m }
       : null,
@@ -140,6 +165,91 @@ async function fetchTripUpdatesFeed() {
   }
 
   return transit_realtime.FeedMessage.decode(new Uint8Array(buf));
+}
+
+async function handleRoutesList(env) {
+  const routes = await loadRoutes(env);
+  const list = Object.entries(routes).map(([route_id, r]) => ({ route_id, ...r }));
+  list.sort((a, b) => {
+    if (a.mode !== b.mode) return a.mode === "rail" ? -1 : 1;
+    return a.short_name.localeCompare(b.short_name, undefined, { numeric: true });
+  });
+  return json(list);
+}
+
+async function handleRouteDirections(routeId, env) {
+  const routeStops = await loadRouteStops(env);
+  const routes = await loadRoutes(env);
+  if (!routes[routeId]) return json({ error: "unknown route_id" }, 404);
+
+  const directions = Object.keys(routeStops)
+    .filter((k) => k.startsWith(`${routeId}|`))
+    .map((k) => {
+      const directionId = k.slice(routeId.length + 1);
+      return {
+        direction_id: directionId,
+        headsign: routeStops[k].headsign,
+        stop_count: routeStops[k].stops.length,
+      };
+    });
+
+  return json({ route_id: routeId, route: routes[routeId], directions });
+}
+
+async function handleRouteTimetable(routeId, directionId, env) {
+  const [routeStops, trips, routes] = await Promise.all([loadRouteStops(env), loadTrips(env), loadRoutes(env)]);
+  if (!routes[routeId]) return json({ error: "unknown route_id" }, 404);
+
+  const key = `${routeId}|${directionId}`;
+  const entry = routeStops[key];
+  if (!entry) return json({ error: "unknown route_id/direction_id combination" }, 404);
+
+  let feed;
+  try {
+    feed = await fetchTripUpdatesFeed();
+  } catch (err) {
+    // Static stop list still works even if the live feed is temporarily down.
+    return json({
+      route_id: routeId,
+      direction_id: directionId,
+      headsign: entry.headsign,
+      stops: entry.stops.map((s) => ({ ...s, eta_minutes: null, arrival_epoch: null })),
+      live_error: err.message,
+    });
+  }
+
+  const now = Date.now() / 1000;
+  const earliestByStop = {};
+
+  for (const entity of feed.entity) {
+    if (!entity.tripUpdate) continue;
+    const tu = entity.tripUpdate;
+    const tripId = tu.trip?.tripId;
+    const tripMeta = trips[tripId];
+    if (!tripMeta) continue;
+
+    const tuRouteId = tu.trip?.routeId || tripMeta.route_id;
+    if (tuRouteId !== routeId) continue;
+    if (String(tripMeta.direction_id) !== String(directionId)) continue;
+
+    for (const stu of tu.stopTimeUpdate || []) {
+      const event = stu.arrival || stu.departure;
+      if (!event || event.time == null) continue;
+      const epoch = Number(event.time);
+      if (epoch - now < -60) continue;
+      if (earliestByStop[stu.stopId] == null || epoch < earliestByStop[stu.stopId]) {
+        earliestByStop[stu.stopId] = epoch;
+      }
+    }
+  }
+
+  const stopsWithEta = entry.stops.map((s) => {
+    const epoch = earliestByStop[s.stop_id];
+    if (epoch == null) return { ...s, eta_minutes: null, arrival_epoch: null };
+    return { ...s, eta_minutes: Math.max(0, Math.round((epoch - now) / 60)), arrival_epoch: epoch };
+  });
+
+  return json({ route_id: routeId, direction_id: directionId, headsign: entry.headsign, stops: stopsWithEta });
 }
 
 async function handleArrivals(stopId, env) {
@@ -206,6 +316,22 @@ export default {
 
       if (url.pathname === "/api/stops/nearby") {
         return await handleNearby(url, env);
+      }
+
+      if (url.pathname === "/api/routes") {
+        return await handleRoutesList(env);
+      }
+
+      const directionsMatch = url.pathname.match(/^\/api\/routes\/([^/]+)\/directions$/);
+      if (directionsMatch) {
+        return await handleRouteDirections(decodeURIComponent(directionsMatch[1]), env);
+      }
+
+      const timetableMatch = url.pathname.match(/^\/api\/routes\/([^/]+)\/timetable$/);
+      if (timetableMatch) {
+        const directionId = url.searchParams.get("direction_id");
+        if (directionId == null) return json({ error: "direction_id query param is required" }, 400);
+        return await handleRouteTimetable(decodeURIComponent(timetableMatch[1]), directionId, env);
       }
 
       const arrivalsMatch = url.pathname.match(/^\/api\/arrivals\/(.+)$/);
